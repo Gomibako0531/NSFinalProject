@@ -1,34 +1,99 @@
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.util.*;
 import java.util.Base64;
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class Server {
 
-    // username -> handler
+    // username -> handler (online users)
     private static final Map<String, ClientHandler> clients = new ConcurrentHashMap<>();
 
     // channel -> Channel
     private static final Map<String, Channel> channels = new ConcurrentHashMap<>();
 
-    // messageId -> sender username (for read receipt)
+    // auth: username -> AuthRecord (salt + hash)
+    private static final Map<String, AuthRecord> auth = new ConcurrentHashMap<>();
+
+    // messageId -> sender username (read receipt)
     private static final Map<Long, String> messageSenders = new ConcurrentHashMap<>();
+
+    // messageId -> MessageRecord (for delete)
+    private static final Map<Long, MessageRecord> messages = new ConcurrentHashMap<>();
+
     private static final AtomicLong msgId = new AtomicLong(1);
 
+    // ---------- Auth ----------
+    private static class AuthRecord {
+        final byte[] salt;
+        final byte[] hash;
+        AuthRecord(byte[] salt, byte[] hash) { this.salt = salt; this.hash = hash; }
+    }
+
+    private static byte[] sha256(byte[] input) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return md.digest(input);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static AuthRecord makeAuth(String password) {
+        byte[] salt = new byte[16];
+        new SecureRandom().nextBytes(salt);
+        byte[] passBytes = password.getBytes(StandardCharsets.UTF_8);
+        byte[] combined = new byte[salt.length + passBytes.length];
+        System.arraycopy(salt, 0, combined, 0, salt.length);
+        System.arraycopy(passBytes, 0, combined, salt.length, passBytes.length);
+        byte[] hash = sha256(combined);
+        return new AuthRecord(salt, hash);
+    }
+
+    private static boolean verifyAuth(AuthRecord rec, String password) {
+        byte[] passBytes = password.getBytes(StandardCharsets.UTF_8);
+        byte[] combined = new byte[rec.salt.length + passBytes.length];
+        System.arraycopy(rec.salt, 0, combined, 0, rec.salt.length);
+        System.arraycopy(passBytes, 0, combined, rec.salt.length, passBytes.length);
+        byte[] hash = sha256(combined);
+        return Arrays.equals(hash, rec.hash);
+    }
+
+    // ---------- Channel ----------
     private static class Channel {
         final String name;
         final String owner;
-        volatile String password; // null = no password
+        volatile String password; // null = none
         final CopyOnWriteArraySet<ClientHandler> members = new CopyOnWriteArraySet<>();
 
         Channel(String name, String owner, String password) {
             this.name = name;
             this.owner = owner;
             this.password = (password == null || password.isBlank()) ? null : password;
+        }
+    }
+
+    // ---------- Message record ----------
+    private enum MsgType { DM, CHANNEL }
+
+    private static class MessageRecord {
+        final long id;
+        final MsgType type;
+        final String from;
+        final String to;      // DM target, else null
+        final String channel; // channel name, else null
+
+        MessageRecord(long id, MsgType type, String from, String to, String channel) {
+            this.id = id;
+            this.type = type;
+            this.from = from;
+            this.to = to;
+            this.channel = channel;
         }
     }
 
@@ -47,7 +112,7 @@ public class Server {
             }
         } catch (java.net.BindException be) {
             System.out.println("Server error: Address already in use (port " + port + ")");
-            System.out.println("Fix: use another port, or stop the process using it:");
+            System.out.println("Fix:");
             System.out.println("  lsof -nP -iTCP:" + port + " -sTCP:LISTEN");
             System.out.println("  kill <PID>");
         } catch (IOException e) {
@@ -57,9 +122,7 @@ public class Server {
     }
 
     private static void broadcastToChannel(Channel ch, String line) {
-        for (ClientHandler m : ch.members) {
-            m.send(line);
-        }
+        for (ClientHandler m : ch.members) m.send(line);
     }
 
     private static void sendToUser(String username, String line) {
@@ -75,11 +138,9 @@ public class Server {
         private final Socket socket;
         private BufferedReader in;
         private PrintWriter out;
-        private String username;
+        private String username; // logged-in name
 
-        ClientHandler(Socket socket) {
-            this.socket = socket;
-        }
+        ClientHandler(Socket socket) { this.socket = socket; }
 
         void send(String line) {
             if (out != null) out.println(line);
@@ -88,27 +149,21 @@ public class Server {
         @Override
         public void run() {
             try {
-                in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                in  = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
                 out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);
 
                 send("INFO Welcome.");
-                send("INFO Commands: /login /msg /createchannel /setchanpass /join /channelmsg /sendfile /delivered /kick /deletechannel /mychannels /quit");
+                send("INFO Auth: /register <user> <pass> then /login <user> <pass>");
+                send("INFO Commands: /msg /createchannel /setchanpass /channels /join /leave /channelmsg /sendfile /delete /delivered /kick /deletechannel /mychannels /quit");
 
                 String line;
                 while ((line = in.readLine()) != null) {
                     line = line.trim();
                     if (line.isEmpty()) continue;
 
-                    if (line.startsWith("/")) {
-                        handleCommand(line);
-                    } else {
-                        // Optional fallback: global broadcast
-                        if (!ensureLogin()) continue;
-                        long id = msgId.getAndIncrement();
-                        messageSenders.put(id, username);
-                        for (ClientHandler h : clients.values()) {
-                            h.send("MSG " + id + " " + username + " " + line);
-                        }
+                    if (line.startsWith("/")) handleCommand(line);
+                    else {
+                        send("ERR Please use channels or DM. (Join a channel or use /msg)");
                     }
                 }
             } catch (IOException ignored) {
@@ -132,21 +187,31 @@ public class Server {
             String cmd = parts[0];
 
             switch (cmd) {
+                // auth
+                case "/register": register(parts); break;
                 case "/login": login(parts); break;
-                case "/msg": dm(parts); break;
 
+                // messaging
+                case "/msg": dm(parts); break;
+                case "/delete": deleteMessage(parts); break;
+                case "/delivered": delivered(parts); break;
+
+                // channels
+                case "/channels": listChannels(); break;
                 case "/createchannel": createChannel(line); break;
                 case "/setchanpass": setChanPass(parts); break;
                 case "/join": join(line); break;
+                case "/leave": leaveChannel(parts); break;
                 case "/channelmsg": channelMsg(parts); break;
 
+                // file
                 case "/sendfile": sendFile(parts); break;
 
-                case "/delivered": delivered(parts); break;
-
+                // admin
                 case "/kick": kick(parts); break;
                 case "/deletechannel": deleteChannel(parts); break;
 
+                // info
                 case "/mychannels": myChannels(); break;
 
                 case "/quit":
@@ -159,19 +224,38 @@ public class Server {
             }
         }
 
-        // /login <username>
+        // /register <user> <pass>
+        private void register(String[] parts) {
+            if (parts.length < 3) { send("ERR Usage: /register <user> <pass>"); return; }
+            String user = parts[1].trim();
+            String pass = parts[2];
+
+            if (user.isEmpty()) { send("ERR Empty username"); return; }
+            if (auth.containsKey(user)) { send("ERR USER_ALREADY_EXISTS"); return; }
+
+            auth.put(user, makeAuth(pass));
+            send("OK REGISTER " + user);
+        }
+
+        // /login <user> <pass>
         private void login(String[] parts) {
-            if (parts.length < 2) { send("ERR Usage: /login <username>"); return; }
-            if (username != null) { send("ERR Already logged in."); return; }
+            if (parts.length < 3) { send("ERR Usage: /login <user> <pass>"); return; }
+            if (username != null) { send("ERR Already logged in as " + username); return; }
 
-            String name = parts[1].trim();
-            if (name.isEmpty()) { send("ERR Empty username"); return; }
+            String user = parts[1].trim();
+            String pass = parts[2];
 
-            if (clients.putIfAbsent(name, this) != null) {
-                send("ERR USERNAME_TAKEN");
+            AuthRecord rec = auth.get(user);
+            if (rec == null) { send("ERR NO_SUCH_USER"); return; }
+            if (!verifyAuth(rec, pass)) { send("ERR WRONG_PASSWORD"); return; }
+
+            // prevent double login
+            if (clients.putIfAbsent(user, this) != null) {
+                send("ERR USER_ALREADY_ONLINE");
                 return;
             }
-            username = name;
+
+            username = user;
             send("OK LOGIN " + username);
         }
 
@@ -182,10 +266,13 @@ public class Server {
 
             String to = parts[1];
             String msg = parts[2];
-            if (!clients.containsKey(to)) { send("ERR User not found: " + to); return; }
+
+            if (!auth.containsKey(to)) { send("ERR No such user: " + to); return; }
+            if (!clients.containsKey(to)) { send("ERR User is offline: " + to); return; }
 
             long id = msgId.getAndIncrement();
             messageSenders.put(id, username);
+            messages.put(id, new MessageRecord(id, MsgType.DM, username, to, null));
 
             sendToUser(to, "MSG " + id + " " + username + " " + msg);
             send("MSG " + id + " " + username + " (to " + to + ") " + msg);
@@ -194,6 +281,82 @@ public class Server {
             if (msg.contains("@" + to)) {
                 sendToUser(to, "MENTION " + id + " DM " + username + " " + msg);
             }
+        }
+
+        // /delete <messageId>
+        private void deleteMessage(String[] parts) {
+            if (!ensureLogin()) return;
+            if (parts.length < 2) { send("ERR Usage: /delete <messageId>"); return; }
+
+            long id;
+            try { id = Long.parseLong(parts[1]); }
+            catch (NumberFormatException e) { send("ERR Invalid messageId"); return; }
+
+            MessageRecord rec = messages.get(id);
+            if (rec == null) { send("ERR No such messageId"); return; }
+
+            boolean allowed = false;
+
+            if (rec.type == MsgType.DM) {
+                // only sender can delete DM
+                allowed = rec.from.equals(username);
+            } else if (rec.type == MsgType.CHANNEL) {
+                // sender OR channel owner can delete
+                Channel ch = channels.get(rec.channel);
+                if (ch != null) {
+                    allowed = rec.from.equals(username) || ch.owner.equals(username);
+                }
+            }
+
+            if (!allowed) { send("ERR Not allowed to delete this message"); return; }
+
+            // remove record
+            messages.remove(id);
+            messageSenders.remove(id);
+
+            // notify recipients
+            if (rec.type == MsgType.DM) {
+                send("OK DELETE " + id);
+                sendToUser(rec.to, "DELETED " + id + " DM");
+            } else {
+                Channel ch = channels.get(rec.channel);
+                if (ch != null) {
+                    send("OK DELETE " + id);
+                    broadcastToChannel(ch, "DELETED " + id + " " + rec.channel);
+                } else {
+                    send("ERR Channel missing for this message");
+                }
+            }
+        }
+
+        // /delivered <messageId>
+        private void delivered(String[] parts) {
+            if (!ensureLogin()) return;
+            if (parts.length < 2) { send("ERR Usage: /delivered <messageId>"); return; }
+
+            long id;
+            try { id = Long.parseLong(parts[1]); }
+            catch (NumberFormatException e) { return; }
+
+            String sender = messageSenders.get(id);
+            if (sender == null) return;
+
+            ClientHandler senderH = clients.get(sender);
+            if (senderH != null && !sender.equals(username)) {
+                senderH.send("DELIVERED " + id + " " + username);
+            }
+        }
+
+        // /channels
+        private void listChannels() {
+            if (!ensureLogin()) return;
+
+            send("CHANNELS_BEGIN");
+            for (Channel ch : channels.values()) {
+                String locked = (ch.password == null) ? "open" : "locked";
+                send("CHANNEL " + ch.name + " " + locked + " owner=" + ch.owner + " members=" + ch.members.size());
+            }
+            send("CHANNELS_END");
         }
 
         // /createchannel <name> [password]
@@ -255,6 +418,22 @@ public class Server {
             broadcastToChannel(ch, "INFO [" + channel + "] " + username + " joined.");
         }
 
+        // /leave <channel>
+        private void leaveChannel(String[] parts) {
+            if (!ensureLogin()) return;
+            if (parts.length < 2) { send("ERR Usage: /leave <channel>"); return; }
+
+            String channel = parts[1];
+            Channel ch = channels.get(channel);
+            if (ch == null) { send("ERR Channel not found: " + channel); return; }
+
+            if (!ch.members.contains(this)) { send("ERR You are not in channel: " + channel); return; }
+
+            ch.members.remove(this);
+            send("OK LEAVE " + channel);
+            broadcastToChannel(ch, "INFO [" + channel + "] " + username + " left.");
+        }
+
         // /channelmsg <channel> <message>
         private void channelMsg(String[] parts) {
             if (!ensureLogin()) return;
@@ -269,6 +448,7 @@ public class Server {
 
             long id = msgId.getAndIncrement();
             messageSenders.put(id, username);
+            messages.put(id, new MessageRecord(id, MsgType.CHANNEL, username, null, channel));
 
             broadcastToChannel(ch, "CHANNELMSG " + id + " " + channel + " " + username + " " + msg);
 
@@ -287,7 +467,8 @@ public class Server {
             if (parts.length < 3) { send("ERR Usage: /sendfile <user> <filename> <base64>"); return; }
 
             String to = parts[1];
-            if (!clients.containsKey(to)) { send("ERR User not found: " + to); return; }
+            if (!auth.containsKey(to)) { send("ERR No such user: " + to); return; }
+            if (!clients.containsKey(to)) { send("ERR User is offline: " + to); return; }
 
             String rest = parts[2];
             int sp = rest.indexOf(' ');
@@ -303,24 +484,6 @@ public class Server {
             send("INFO File sent to " + to + ": " + filename);
         }
 
-        // /delivered <messageId>
-        private void delivered(String[] parts) {
-            if (!ensureLogin()) return;
-            if (parts.length < 2) { send("ERR Usage: /delivered <messageId>"); return; }
-
-            long id;
-            try { id = Long.parseLong(parts[1]); }
-            catch (NumberFormatException e) { send("ERR Invalid messageId"); return; }
-
-            String sender = messageSenders.get(id);
-            if (sender == null) return;
-
-            ClientHandler senderH = clients.get(sender);
-            if (senderH != null && !sender.equals(username)) {
-                senderH.send("DELIVERED " + id + " " + username);
-            }
-        }
-
         // /kick <channel> <user>
         private void kick(String[] parts) {
             if (!ensureLogin()) return;
@@ -334,10 +497,7 @@ public class Server {
             if (!ch.owner.equals(username)) { send("ERR Only owner can kick."); return; }
 
             ClientHandler target = clients.get(targetUser);
-            if (target == null || !ch.members.contains(target)) {
-                send("ERR User not in channel.");
-                return;
-            }
+            if (target == null || !ch.members.contains(target)) { send("ERR User not in channel."); return; }
 
             ch.members.remove(target);
             target.send("INFO You were removed from #" + channel + " by " + username);
@@ -356,6 +516,16 @@ public class Server {
 
             broadcastToChannel(ch, "INFO Channel #" + channel + " was deleted by " + username);
             channels.remove(channel);
+
+            // remove messages that belonged to this channel (cleanup)
+            for (Map.Entry<Long, MessageRecord> e : messages.entrySet()) {
+                MessageRecord r = e.getValue();
+                if (r.type == MsgType.CHANNEL && channel.equals(r.channel)) {
+                    messages.remove(e.getKey());
+                    messageSenders.remove(e.getKey());
+                }
+            }
+
             send("OK DELETECHANNEL " + channel);
         }
 
@@ -367,33 +537,6 @@ public class Server {
                 if (ch.members.contains(this)) sb.append(" ").append(ch.name);
             }
             send(sb.toString());
-        }
-
-        // /leave <channel>
-        private void leaveChannel(String[] parts) {
-            if (!ensureLogin()) return;
-            if (parts.length < 2) {
-            send("ERR Usage: /leave <channel>");
-            return;
-            }
-
-            String channelName = parts[1];
-            Channel ch = channels.get(channelName);
-
-            if (ch == null) {
-                send("ERR Channel not found: " + channelName);
-                return;
-            }
-
-            if (!ch.members.contains(this)) {
-                send("ERR You are not in channel: " + channelName);
-                return;
-            }
-
-            ch.members.remove(this);
-            send("OK LEAVE " + channelName);
-
-            broadcastToChannel(ch, "INFO [" + channelName + "] " + username + " left the channel.");
         }
     }
 }
