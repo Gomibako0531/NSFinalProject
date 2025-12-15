@@ -21,20 +21,7 @@ public class Client {
              BufferedReader userIn = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
 
             System.out.println("Connected to " + host + ":" + port);
-            System.out.println("Commands:");
-            System.out.println("  /login <name>");
-            System.out.println("  /msg <user> <message>");
-            System.out.println("  /createchannel <name> [password]");
-            System.out.println("  /setchanpass <channel> <password>");
-            System.out.println("  /join <channel> [password]");
-            System.out.println("  /channelmsg <channel> <message>");
-            System.out.println("  /sendfile <user> <filepath>");
-            System.out.println("  /mychannels");
-            System.out.println("  /kick <channel> <user>");
-            System.out.println("  /leave <channel>");
-            System.out.println("  /deletechannel <channel>");
-            System.out.println("  /quit");
-            System.out.println("Tip: after /join <channel>, normal text will go to that channel.");
+            printHelp();
 
             AtomicReference<String> currentChannel = new AtomicReference<>(null);
 
@@ -56,6 +43,11 @@ public class Client {
                 input = input.trim();
                 if (input.isEmpty()) continue;
 
+                if (input.equals("/help")) {
+                    printHelp();
+                    continue;
+                }
+
                 if (input.startsWith("/sendfile ")) {
                     handleSendFileCommand(input, serverOut);
                     continue;
@@ -67,6 +59,16 @@ public class Client {
                     if (p.length >= 2) {
                         currentChannel.set(p[1]);
                         System.out.println("[INFO] currentChannel = #" + p[1]);
+                    }
+                    continue;
+                }
+
+                if (input.startsWith("/leave ")) {
+                    serverOut.println(input);
+                    String[] p = input.split("\\s+", 3);
+                    if (p.length >= 2 && p[1].equals(currentChannel.get())) {
+                        currentChannel.set(null);
+                        System.out.println("[INFO] currentChannel cleared");
                     }
                     continue;
                 }
@@ -87,6 +89,7 @@ public class Client {
                     continue;
                 }
 
+                // Normal text -> send to current channel
                 String ch = currentChannel.get();
                 if (ch == null) {
                     System.out.println("[WARN] Join a channel first: /join <channel>");
@@ -100,13 +103,32 @@ public class Client {
         }
     }
 
+    private static void printHelp() {
+        System.out.println("Commands:");
+        System.out.println("  /register <user> <pass>");
+        System.out.println("  /login <user> <pass>");
+        System.out.println("  /channels");
+        System.out.println("  /createchannel <name> [password]");
+        System.out.println("  /setchanpass <channel> <password>");
+        System.out.println("  /join <channel> [password]");
+        System.out.println("  /leave <channel>");
+        System.out.println("  /mychannels");
+        System.out.println("  /msg <user> <message>");
+        System.out.println("  /delete <messageId>");
+        System.out.println("  /sendfile <user> <filepath>");
+        System.out.println("  /kick <channel> <user>");
+        System.out.println("  /deletechannel <channel>");
+        System.out.println("  /quit");
+        System.out.println("Tip: after /join <channel>, normal text will go to that channel.");
+    }
+
     private static void handleServerLine(String line, PrintWriter serverOut) {
         if (line.startsWith("MSG ")) {
             // MSG <id> <from> <message>
             String[] p = line.split(" ", 4);
             if (p.length >= 4) {
                 System.out.println("[DM#" + p[1] + "] " + p[2] + ": " + p[3]);
-                serverOut.println("/delivered " + p[1]); // auto read receipt
+                serverOut.println("/delivered " + p[1]);
             } else System.out.println(line);
 
         } else if (line.startsWith("CHANNELMSG ")) {
@@ -114,22 +136,26 @@ public class Client {
             String[] p = line.split(" ", 5);
             if (p.length >= 5) {
                 System.out.println("[#" + p[2] + " #" + p[1] + "] " + p[3] + ": " + p[4]);
-                serverOut.println("/delivered " + p[1]); // auto read receipt
+                serverOut.println("/delivered " + p[1]);
             } else System.out.println(line);
 
         } else if (line.startsWith("DELIVERED ")) {
             // DELIVERED <id> <user>
             String[] p = line.split(" ", 3);
-            if (p.length == 3) {
-                System.out.println("[READ] Message #" + p[1] + " read by " + p[2]);
-            } else System.out.println(line);
+            if (p.length == 3) System.out.println("[READ] Message #" + p[1] + " read by " + p[2]);
+            else System.out.println(line);
+
+        } else if (line.startsWith("DELETED ")) {
+            // DELETED <id> <DM|channel>
+            String[] p = line.split(" ", 3);
+            if (p.length >= 3) System.out.println("[DELETED] Message #" + p[1] + " (" + p[2] + ")");
+            else System.out.println(line);
 
         } else if (line.startsWith("MENTION ")) {
             // MENTION <id> <channelOrDM> <from> <message>
             String[] p = line.split(" ", 5);
-            if (p.length >= 5) {
-                System.out.println("[MENTION #" + p[1] + " in " + p[2] + "] " + p[3] + ": " + p[4]);
-            } else System.out.println(line);
+            if (p.length >= 5) System.out.println("[MENTION #" + p[1] + " in " + p[2] + "] " + p[3] + ": " + p[4]);
+            else System.out.println(line);
 
         } else if (line.startsWith("FILE_FROM ")) {
             // FILE_FROM <from> <filename> <base64>
@@ -139,6 +165,12 @@ public class Client {
                 saveIncomingFile(p[2], p[3]);
             } else System.out.println(line);
 
+        } else if (line.equals("CHANNELS_BEGIN")) {
+            System.out.println("[CHANNEL LIST]");
+        } else if (line.equals("CHANNELS_END")) {
+            System.out.println("[END CHANNEL LIST]");
+        } else if (line.startsWith("CHANNEL ")) {
+            System.out.println("  " + line.substring("CHANNEL ".length()));
         } else {
             System.out.println(line);
         }
